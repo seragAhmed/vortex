@@ -43,6 +43,7 @@ use crate::dtype::IntegerPType;
 use crate::dtype::Nullability;
 use crate::dtype::OffsetBuilderPType;
 use crate::match_each_integer_ptype;
+use crate::optimizer::ArrayOptimizer;
 use crate::scalar::ListScalar;
 use crate::scalar::Scalar;
 
@@ -328,8 +329,7 @@ impl<O: OffsetBuilderPType, S: OffsetBuilderPType> ListViewBuilder<O, S> {
             return Ok(());
         }
 
-        self.nulls.append_validity(array.validity()?, array.len());
-
+        let validity = array.validity()?;
         let offsets = array.offsets().clone().execute::<PrimitiveArray>(ctx)?;
         match_each_integer_ptype!(offsets.ptype(), |OffsetType| {
             extend_from_list(
@@ -339,6 +339,7 @@ impl<O: OffsetBuilderPType, S: OffsetBuilderPType> ListViewBuilder<O, S> {
                 ctx,
             )?
         });
+        self.nulls.append_validity(validity, array.len());
         Ok(())
     }
 
@@ -385,11 +386,10 @@ impl<O: OffsetBuilderPType, S: OffsetBuilderPType> ListViewBuilder<O, S> {
             array.into_owned().referenced_element_bounds(ctx)?
         };
 
-        // An exact source references every element it carries, back to back, so it lands flush
-        // against the elements already in the builder. Any other layout does not.
-        self.zero_copy_to_list &= array.is_zero_copy_to_list();
-
-        self.nulls.append_validity(array.validity()?, len);
+        let validity = array.validity()?;
+        let elements = (end > start)
+            .then(|| array.elements().slice(start..end)?.optimize_ctx(ctx))
+            .transpose()?;
 
         // Bulk append the referenced elements; the offsets are rebased onto them below.
         let elements_base = self.elements_builder.len();
@@ -401,9 +401,16 @@ impl<O: OffsetBuilderPType, S: OffsetBuilderPType> ListViewBuilder<O, S> {
             "appending this list would cause an offset overflow"
         );
 
-        if end > start {
-            self.elements_builder
-                .append_array(&array.elements().slice(start..end)?, ctx)?;
+        // Nothing below can fail, so a failed append leaves the builder as it was.
+        //
+        // An exact source references every element it carries, back to back, so it lands flush
+        // against the elements already in the builder. Any other layout does not.
+        self.zero_copy_to_list &= array.is_zero_copy_to_list();
+
+        self.nulls.append_validity(validity, len);
+
+        if let Some(elements) = elements {
+            self.elements_builder.append_optimized(elements);
         }
 
         // Every view lies inside `start..end`, so rebasing it onto `elements_base` keeps it inside
@@ -549,6 +556,10 @@ where
     let first: usize = offsets[0].as_();
     let last: usize = offsets[num_lists].as_();
 
+    let new_elements = (last > first)
+        .then(|| elements.slice(first..last)?.optimize_ctx(ctx))
+        .transpose()?;
+
     let elements_base = builder.elements_builder.len();
 
     // We must assert this even in release mode to ensure that the safety comment in
@@ -558,10 +569,9 @@ where
         "appending this list would cause an offset overflow"
     );
 
-    if last > first {
-        builder
-            .elements_builder
-            .append_array(&elements.slice(first..last)?, ctx)?;
+    // Nothing below can fail, so a failed append leaves the builder as it was.
+    if let Some(new_elements) = new_elements {
+        builder.elements_builder.append_optimized(new_elements);
     }
 
     builder.offsets_builder.reserve_exact(num_lists);

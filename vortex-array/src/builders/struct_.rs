@@ -25,6 +25,7 @@ use crate::canonical::Canonical;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::StructFields;
+use crate::optimizer::ArrayOptimizer;
 use crate::scalar::Scalar;
 use crate::scalar::StructScalar;
 
@@ -158,14 +159,19 @@ impl StructBuilder {
         array: ArrayView<'_, Struct>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
-        for (field, builder) in array
+        // Run every fallible step before changing any field, so that a failed append leaves the
+        // builder as it was.
+        let validity = array.validity()?;
+        let fields = array
             .iter_unmasked_fields()
-            .zip_eq(self.builders.iter_mut())
-        {
-            builder.append_array(field, ctx)?;
+            .map(|field| field.optimize_ctx(ctx))
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        for (field, builder) in fields.into_iter().zip_eq(self.builders.iter_mut()) {
+            builder.append_optimized(field);
         }
 
-        self.nulls.append_validity(array.validity()?, array.len());
+        self.nulls.append_validity(validity, array.len());
         Ok(())
     }
 }

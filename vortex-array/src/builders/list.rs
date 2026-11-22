@@ -36,6 +36,7 @@ use crate::dtype::Nullability;
 use crate::dtype::Nullability::NonNullable;
 use crate::dtype::OffsetBuilderPType;
 use crate::match_each_integer_ptype;
+use crate::optimizer::ArrayOptimizer;
 use crate::scalar::ListScalar;
 use crate::scalar::Scalar;
 
@@ -217,8 +218,7 @@ impl<O: OffsetBuilderPType> ListBuilder<O> {
             return Ok(());
         }
 
-        self.nulls.append_validity(array.validity()?, array.len());
-
+        let validity = array.validity()?;
         let num_lists = array.len();
         let offsets = array.offsets().clone().execute::<PrimitiveArray>(ctx)?;
         match_each_integer_ptype!(offsets.ptype(), |OffsetType| {
@@ -228,10 +228,15 @@ impl<O: OffsetBuilderPType> ListBuilder<O> {
 
             // Lists in a `ListArray` are contiguous, so the referenced elements can be appended
             // in bulk and the offsets rebased onto this builder's elements.
+            let elements = (last > first)
+                .then(|| array.elements().slice(first..last)?.optimize_ctx(ctx))
+                .transpose()?;
+
+            // Nothing below can fail, so a failed append leaves the builder as it was.
+            self.nulls.append_validity(validity, num_lists);
             let elements_base = self.elements_builder.len();
-            if last > first {
-                self.elements_builder
-                    .append_array(&array.elements().slice(first..last)?, ctx)?;
+            if let Some(elements) = elements {
+                self.elements_builder.append_optimized(elements);
             }
 
             self.offsets_builder.reserve_exact(num_lists);
@@ -267,11 +272,12 @@ impl<O: OffsetBuilderPType> ListBuilder<O> {
             return Ok(());
         }
 
-        self.nulls.append_validity(array.validity()?, array.len());
+        let validity = array.validity()?;
+        let len = array.len();
 
         // Flatten the views into the only layout `ListArray` offsets can express. This is a cheap
         // clone when they already are laid out that way, and the flattened result keeps the
-        // original validity, so the null map appended above still describes it.
+        // original validity, so the null map read above still describes it.
         let array = array
             .into_owned()
             .rebuild(ListViewRebuildMode::MakeZeroCopyToList, ctx)?;
@@ -293,6 +299,7 @@ impl<O: OffsetBuilderPType> ListBuilder<O> {
                 )?
             })
         });
+        self.nulls.append_validity(validity, len);
         Ok(())
     }
 }
@@ -324,11 +331,14 @@ where
     let first: usize = new_offsets[0].as_();
     let last: usize = new_offsets[num_lists - 1].as_() + new_sizes[num_lists - 1].as_();
 
+    let elements = (last > first)
+        .then(|| new_elements.slice(first..last)?.optimize_ctx(ctx))
+        .transpose()?;
+
+    // Nothing below can fail, so a failed append leaves the builder as it was.
     let elements_base = builder.elements_builder.len();
-    if last > first {
-        builder
-            .elements_builder
-            .append_array(&new_elements.slice(first..last)?, ctx)?;
+    if let Some(elements) = elements {
+        builder.elements_builder.append_optimized(elements);
     }
 
     builder.offsets_builder.reserve_exact(num_lists);

@@ -111,6 +111,26 @@ impl ChildBuilder {
         Ok(())
     }
 
+    /// Appends `array`, which the caller has already optimized, as a chunk of its own.
+    ///
+    /// Unlike [`append_array`](Self::append_array) this cannot fail, so a nested builder can run
+    /// every fallible step of an append before it changes any of its parts.
+    pub(crate) fn append_optimized(&mut self, array: ArrayRef) {
+        debug_assert_eq!(
+            array.dtype(),
+            &self.dtype,
+            "Cannot append an array to a child builder of a different dtype",
+        );
+
+        if array.is_empty() {
+            return;
+        }
+
+        self.flush_pending();
+        self.chunks_len += array.len();
+        self.chunks.push(array);
+    }
+
     /// Appends a single [`Scalar`] to the child.
     pub fn append_scalar(&mut self, scalar: &Scalar) -> VortexResult<()> {
         self.pending().append_scalar(scalar)

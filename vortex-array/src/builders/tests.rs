@@ -17,6 +17,7 @@ use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
@@ -25,6 +26,7 @@ use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::RecursiveCanonical;
 use crate::VortexSessionExecute;
+use crate::array::ArrayView;
 use crate::array::IntoArray;
 use crate::arrays::Chunked;
 use crate::arrays::ChunkedArray;
@@ -51,6 +53,8 @@ use crate::arrays::struct_::StructArrayExt;
 use crate::assert_arrays_eq;
 use crate::builders::ArrayBuilder;
 use crate::builders::ListBuilder;
+use crate::builders::ListViewBuilder;
+use crate::builders::StructBuilder;
 use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
@@ -61,6 +65,8 @@ use crate::dtype::extension::ExtDTypeRef;
 use crate::dtype::half::f16;
 use crate::extension::datetime::TimeUnit;
 use crate::extension::datetime::Timestamp;
+use crate::optimizer::kernels::ArrayKernelsExt;
+use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::scalar::Scalar;
 use crate::validity::Validity;
 
@@ -1450,5 +1456,159 @@ fn test_chunked_children_canonicalize_recursively() -> VortexResult<()> {
         StructArray::try_from_iter([("a", buffer![0i32; 2 * CHUNK_LEN].into_array())])?;
     assert_arrays_eq!(&recursive.into_array(), &independent, &mut ctx);
 
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FailingChunkedConstantRule;
+
+impl ArrayParentReduceRule<Constant> for FailingChunkedConstantRule {
+    type Parent = Chunked;
+
+    fn reduce_parent(
+        &self,
+        _array: ArrayView<'_, Constant>,
+        _parent: ArrayView<'_, Chunked>,
+        _child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        vortex_bail!("simulated optimization error")
+    }
+}
+
+/// An execution context whose optimizer fails on a chunked array of constants.
+fn failing_optimizer_ctx() -> ExecutionCtx {
+    let session = VortexSession::empty();
+    session.kernels().register_reduce_parent_rule(
+        Chunked,
+        Constant,
+        const { &FailingChunkedConstantRule },
+    );
+    session.create_execution_ctx()
+}
+
+/// Four `i32` values that [`failing_optimizer_ctx`] cannot optimize, even in part.
+fn unoptimizable_i32s() -> VortexResult<ArrayRef> {
+    Ok(ChunkedArray::try_new(
+        vec![
+            ConstantArray::new(9i32, 2).into_array(),
+            ConstantArray::new(8i32, 2).into_array(),
+        ],
+        PType::I32.into(),
+    )?
+    .into_array())
+}
+
+#[track_caller]
+fn assert_simulated_error<T: std::fmt::Debug>(result: VortexResult<T>) {
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("simulated optimization error"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn struct_builder_is_unchanged_by_a_failed_append() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let mut failing_ctx = failing_optimizer_ctx();
+    let fields = StructFields::new(
+        ["a", "b"].into(),
+        vec![PType::I32.into(), PType::I32.into()],
+    );
+    let mut builder = StructBuilder::with_capacity_in(
+        fields,
+        Nullability::NonNullable,
+        0,
+        BufferAllocatorRef::static_ref(),
+    );
+
+    let failing = StructArray::try_new(
+        ["a", "b"].into(),
+        [buffer![1i32, 2, 3, 4].into_array(), unoptimizable_i32s()?],
+        4,
+        Validity::NonNullable,
+    )?;
+    assert_simulated_error(builder.append_struct_array(failing.as_view(), &mut failing_ctx));
+    assert_eq!(builder.len(), 0);
+
+    let valid = StructArray::try_new(
+        ["a", "b"].into(),
+        [buffer![5i32].into_array(), buffer![6i32].into_array()],
+        1,
+        Validity::NonNullable,
+    )?;
+    builder.append_struct_array(valid.as_view(), &mut ctx)?;
+    assert_arrays_eq!(builder.finish(), valid, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn list_builders_are_unchanged_by_a_failed_append() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let mut failing_ctx = failing_optimizer_ctx();
+    let element_dtype = Arc::new(DType::from(PType::I32));
+    // Each append gets fresh elements, since optimizing an array marks it as optimized.
+    let failing_list = |ctx: &mut ExecutionCtx| {
+        ListArray::try_new(
+            unoptimizable_i32s()?,
+            buffer![1u32, 4].into_array(),
+            Validity::NonNullable,
+            ctx,
+        )
+    };
+    let failing_listview = |ctx: &mut ExecutionCtx| {
+        ListViewArray::try_new(
+            unoptimizable_i32s()?,
+            buffer![1u32].into_array(),
+            buffer![3u32].into_array(),
+            Validity::NonNullable,
+            ctx,
+        )
+    };
+    let valid = ListArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![0u32, 1, 3].into_array(),
+        Validity::NonNullable,
+        &mut ctx,
+    )?;
+
+    let new_list_builder = || {
+        ListBuilder::<u32>::with_capacity_in(
+            Arc::clone(&element_dtype),
+            Nullability::NonNullable,
+            0,
+            BufferAllocatorRef::static_ref(),
+        )
+    };
+    let new_listview_builder = || {
+        ListViewBuilder::<u32, u32>::with_capacity_in(
+            Arc::clone(&element_dtype),
+            Nullability::NonNullable,
+            0,
+            BufferAllocatorRef::static_ref(),
+        )
+    };
+
+    let mut builder = new_list_builder();
+    assert_simulated_error(
+        builder.append_list_array(failing_list(&mut ctx)?.as_view(), &mut failing_ctx),
+    );
+    assert_simulated_error(
+        builder.append_listview_array(failing_listview(&mut ctx)?.as_view(), &mut failing_ctx),
+    );
+    assert_eq!(builder.len(), 0);
+    builder.append_list_array(valid.as_view(), &mut ctx)?;
+    assert_arrays_eq!(builder.finish(), valid, &mut ctx);
+
+    let mut builder = new_listview_builder();
+    assert_simulated_error(
+        builder.append_list_array(failing_list(&mut ctx)?.as_view(), &mut failing_ctx),
+    );
+    assert_simulated_error(
+        builder.append_listview_array(failing_listview(&mut ctx)?.as_view(), &mut failing_ctx),
+    );
+    assert_eq!(builder.len(), 0);
+    builder.append_list_array(valid.as_view(), &mut ctx)?;
+    assert_arrays_eq!(builder.finish(), valid, &mut ctx);
     Ok(())
 }
